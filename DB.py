@@ -1,0 +1,150 @@
+import sqlite3
+import json
+import base64
+import re
+from imp import reload
+
+db = sqlite3.connect('msgstore.db')
+cur = db.cursor()
+
+#class ComplexEncoder(json.JSONEncoder):
+#	def default(self, obj):
+#		print(type(obj))
+#		if isinstance(obj, bytes):
+#			return 'BLOB DATA'
+#		return json.JSONEncoder.default(self, obj)
+
+def query(obj, count=100, start=0):
+	cur.execute('PRAGMA table_info("messages")')
+	#this returns (cid, name, type, notnull, defaultval, primkey)
+	#			  (1, 'caeks', INTEGER, 0, None, 0)
+	obj['cols'] = [
+		'_id',
+		'key_remote_jid',
+		'key_from_me',
+		#^ key_from_me == 1 && remote_resource != NULL ==> 
+		# 	data == NULL => join/leave
+		#	data != NULL => topic change
+		'data',
+		'timestamp',
+		'media_mime_type',
+		'media_wa_type', 
+		#^meaning: 0 = text, 1 = image; 2 = audio'; 3 = video; 4 = contact; 5 = GPS; 8 = Wapp-call
+		'media_size',
+		'media_name',
+		'media_duration',
+		'latitude',
+		'longitude',
+		'thumb_image',
+		'remote_resource', #sender (for groups)
+		'received_timestamp',
+		'raw_data',
+		'media_caption',
+	]
+	query = "SELECT {col} FROM {tbls} WHERE {ids} AND {count} AND {nocalls}".format(
+		col = 'M.'+', M.'.join(obj['cols']) + ', C.subject',
+		tbls = 'messages AS M, chat_list AS C',
+		ids = 'M.key_remote_jid = C.key_remote_jid',
+		count = 'M._id >= ' + str(start) + ' AND  M._id < '+str(start + count),
+		nocalls = 'M.media_wa_type <> 8 AND M.media_wa_type <> -1', #ignore calls and the VERY first row
+	)
+	obj['cols'].append('subject') #groupchat subject
+	cur.execute(query)
+	obj['rows'] = cur.fetchall()
+
+def readCol(row, colname, cols):
+	if colname in cols:
+		return row[cols.index(colname)]
+	else:
+		return -1
+
+def decodeBytes(obj):
+	rows = obj['rows']
+	for i in range(len(rows)):
+		blobs = []
+		for j in range(len(rows[i])):
+			if isinstance(rows[i][j], bytes):
+				blobs.append(j)
+		for j in blobs:
+			if j == obj['cols'].index('raw_data'):
+				data = base64.b64encode(rows[i][j]).decode('utf-8')
+				#with open('test'+str(i)+'.jpg', 'wb') as f:
+				#	f.write(rows[i][j])
+			elif j == obj['cols'].index('thumb_image'):
+				data = rows[i][j]
+				if b'/WhatsApp/Media/' in data:
+					index = data.index(b'/WhatsApp/Media/')
+					data = data[index:].decode('utf-8')
+				else:
+					data = None
+			else:
+				try:
+					data = rows[i][j].decode('utf-8')
+				except UnicodeDecodeError:
+					print('UnicodeDecodeError. Could not decode:', rows[i][j])
+					data = None
+			rows[i] = rows[i][:j] + (data,) + rows[i][j+1:]
+
+def readTable(src, obj):
+	rows = src['rows']
+	cols = src['cols']
+	for i in range(len(rows)):
+		r = rows[i]
+		row = {}
+		row['timestamp'] = readCol(r, 'timestamp', cols)
+		row['received'] = readCol(r, 'received_timestamp', cols)
+		row['sender'] = readCol(r, 'remote_resource', cols)
+		if row['sender']: #ie. not a message you yourself sent
+			if row['sender'].strip() == '':
+				row['sender'] = readCol(r, 'key_remote_jid', cols)
+			if '@' in row['sender']: #trim the @s.whatsapp.com from the phone number
+				row['sender'] = row['sender'][:row['sender'].index('@')]
+		row['text'] = readCol(r, 'data', cols)
+		#non-chat message data
+		row['type'] = int(readCol(r, 'media_wa_type', cols))
+		#^meaning: 0 = text, 1 = image; 2 = audio'; 3 = video; 4 = contact; 5 = GPS; 8 = Wapp-call
+		if readCol(r, 'key_from_me', cols) == 1 and row['sender'] is not None:
+			if row['text'] is None:
+				row['type'] = -1 #this means it's a join/leave/kick
+			else:
+				row['type'] = -2 #this means it's a group-topic change
+		if row['type'] > 0: #not a message or any kind of status update
+			row['media'] = {}
+			media = row['media']
+			media['type'] = row['type'] #redundant; accessible from both `media` and its parent `row` objects
+			media['mimetype'] = readCol(r, 'media_mime_type', cols)
+			media['filepath'] = readCol(r, 'thumb_image', cols)
+			file_re = r'\/WhatsApp(\/Media\/.*\.\w{3})'
+			if media['filepath']: #No filepath in the DB
+				media['filepath'] = re.search(file_re, media['filepath'])
+			if media['filepath']: #No matches found for the above regex
+				media['filepath'] = '..' + media['filepath'].group(1)
+			media['size'] = readCol(r, 'media_size', cols)
+			media['name'] = readCol(r, 'media_name', cols)
+			media['duration'] = readCol(r, 'media_duration', cols)
+			media['lat-long'] = (readCol(r, 'latitude', cols), readCol(r, 'longitude', cols))
+			media['thumb'] = readCol(r, 'raw_data', cols)
+			if media['thumb']:
+				print( readCol(r, '_id', cols))
+				media['thumb'] = 'data:' + media['mimetype'] + ';base64,' + media['thumb']
+			if (row['text'] is None):
+				row['text'] = readCol(r, 'media_caption', cols)
+		else:
+			row['media'] = None
+		chatname = readCol(r, 'key_remote_jid', cols)
+		if chatname not in obj:
+			obj[chatname] = {'name': readCol(r, 'subject', cols), 'rows': []}
+		obj[chatname]['rows'].append(row)
+
+def writeToJSON(obj):
+	"""writes an object obj generated by readTable() to a json file"""
+	with open('wapp-db.json', 'w+') as f:
+		f.write(json.dumps(obj))
+
+def main(count=100, start=0):
+	db = {'cols': [], 'rows': []}
+	query(db)
+	decodeBytes(db)
+	chat = {}
+	readTable(db, chat)
+	writeToJSON(chat)
