@@ -2,11 +2,11 @@ var http = require("http"), //better to use https tho, but need
 	fs = require("fs"),
 	url = require('url'),
 	zlib = require('zlib'),
-	path = require('path');;
+	path = require('path');
 	
 //global vars
 var port = 80;
-path.separatorRegEx = new RegExp("/(\/|\\)+/");
+path.separatorRegEx = /[\/|\\)+/;
 console.log(path.sep);
 var Server = http.createServer(function (req, res) {
 	var urlData = url.parse(req.url, true),//true will make sure UrlData.query contains an object already instead of only the query string
